@@ -89,6 +89,7 @@ tma_copy(void const* desc_ptr, uint64_t* barrier_ptr, void* smem_ptr,
     if constexpr (kNumTMAMulticast == 1) {
         cute::SM90_TMA_LOAD_2D::copy(desc_ptr, barrier_ptr, cache_hint, smem_ptr, crd_0, crd_1);
     } else if (cute::block_rank_in_cluster() == 0) {
+        // with a mask
         cute::SM90_TMA_LOAD_MULTICAST_2D::copy(desc_ptr, barrier_ptr, (1 << kNumTMAMulticast) - 1, cache_hint, smem_ptr, crd_0, crd_1);
     }
 }

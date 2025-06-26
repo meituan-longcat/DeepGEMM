@@ -88,6 +88,7 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     """
     # NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
     assert x.dim() in (2, 3)
+    origin_dim = x.dim()
     remove_dim = False
     if x.dim() == 2:
         x, remove_dim = x.unsqueeze(0), True
@@ -96,7 +97,7 @@ def get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
     aligned_m = get_tma_aligned_size(m, x.element_size())
 
     # The last kernel gives a column-major TMA aligned layout
-    if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(2) == aligned_m:
+    if (origin_dim == 2 or x.stride(0) == aligned_m * n) and x.stride(1) == 1 and x.stride(2) == aligned_m:
         return x.squeeze(0) if remove_dim else x
 
     # Normal layout requires transposing

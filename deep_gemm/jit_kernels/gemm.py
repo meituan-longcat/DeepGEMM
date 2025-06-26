@@ -1,5 +1,6 @@
 import torch
 from typing import Tuple
+import functools
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
@@ -15,48 +16,81 @@ constexpr auto BLOCK_M = {BLOCK_M};
 constexpr auto BLOCK_N = {BLOCK_N};
 constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
+constexpr auto kIsSwapAB = {IS_SWAP_AB};
+constexpr auto kIsPDL = {IS_PDL};
 
 // Make a templated GEMM
 using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
 
 // Launch kernel
-auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
-auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs);
-auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
-auto tma_d_desc = GemmType::make_2d_tma_d_desc(out, m);
-GemmType::run(out, rhs_scales, nullptr,
-              m,
-              tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
-              stream, num_sms, smem_size);
+// Only swap descriptors
+if constexpr (kIsSwapAB) {
+    auto tma_a_desc = GemmType::make_2d_tma_a_desc_swap_ab(rhs, N);
+    auto tma_b_desc = GemmType::make_2d_tma_b_desc_swap_ab(lhs, m);
+    auto tma_scales_b_desc = GemmType::make_2d_tma_scales_b_desc_swap_ab(lhs_scales, m);
+    auto tma_d_desc = GemmType::make_2d_tma_d_desc_swap_ab(out, m);
+    GemmType::run_swap_ab<kIsPDL>(out, rhs_scales, nullptr,
+                          m,
+                          tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc,
+                          stream, num_sms, smem_size);
+} else {
+    auto tma_a_desc = GemmType::make_2d_tma_a_desc(lhs, m);
+    auto tma_b_desc = GemmType::make_2d_tma_b_desc(rhs);
+    auto tma_scales_a_desc = GemmType::make_2d_tma_scales_a_desc(lhs_scales, m);
+    auto tma_d_desc = GemmType::make_2d_tma_d_desc(out, m);
+    GemmType::run(out, rhs_scales, nullptr,
+                  m,
+                  tma_a_desc, tma_b_desc, tma_scales_a_desc, tma_d_desc,
+                  stream, num_sms, smem_size);
+}
 """
 
 
+# Check whether weight n is divisible by 2x block_n
 def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
     return (n % (block_n * num_tma_multicast) == 0) and num_sms % num_tma_multicast == 0
 
 
-def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128) -> int:
-    smem_d = block_m * block_n * 2
-    smem_a_per_stage = block_m * block_k
-    smem_scales_a_per_stage = block_m * 4
-    smem_b_per_stage = block_n * block_k
-    smem_scales_b = ceil_div(k, block_k) * 4
-    smem_barrier = num_stages * 8 * 2
+def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: int = 128, is_swap_ab: bool = False) -> int:
+    if not is_swap_ab:
+        smem_d = block_m * block_n * 2
+        smem_a_per_stage = block_m * block_k
+        smem_scales_a_per_stage = block_m * 4
+        smem_b_per_stage = block_n * block_k
+        smem_scales_b = ceil_div(k, block_k) * 4
+        smem_barrier = num_stages * 8 * 2
 
-    smem_size = 0
-    smem_size += smem_d
-    smem_size += num_stages * smem_a_per_stage
-    smem_size += num_stages * smem_scales_a_per_stage
-    smem_size += num_stages * smem_b_per_stage
-    smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
-    smem_size += smem_barrier
-    return smem_size
+        smem_size = 0
+        smem_size += smem_d
+        smem_size += num_stages * smem_a_per_stage
+        smem_size += num_stages * smem_scales_a_per_stage
+        smem_size += num_stages * smem_b_per_stage
+        smem_size += ceil_div(smem_scales_b * (1 if block_k % block_n == 0 else 2), 8) * 8
+        smem_size += smem_barrier
+        return smem_size
+    else:
+        smem_d = block_n * block_m * 2
+        smem_a_per_stage = block_m * block_k
+        smem_b_per_stage = block_n * block_k
+        smem_scales_b = ceil_div(block_n * 4, 128) * 128
+        smem_scales_a_per_stage = ceil_div(k, block_k) * 4
+        smem_barrier = num_stages * 8 * 2
+
+        smem_size = 0
+        smem_size += smem_d
+        smem_size += num_stages * smem_a_per_stage
+        smem_size += num_stages * smem_b_per_stage
+        smem_size += num_stages * smem_scales_b
+        smem_size += ceil_div(smem_scales_a_per_stage, 8) * 8
+        smem_size += smem_barrier
+        return smem_size
 
 
+@functools.lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
-                     is_grouped_contiguous: bool = False) -> Tuple[int, int, int, int, int]:
+                     is_grouped_contiguous: bool = False, is_swap_ab = False) -> Tuple[int, int, int, int, int]:
     if not is_grouped_contiguous:
         # TODO: for some cases, smaller M block is better, add them into tuning space
         block_ms = (64 if m <= 64 else 128, )
@@ -90,7 +124,7 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
     # NOTES: for double B scales, the best number of stages may be reduced
     best_num_stages, best_smem_size, sm90_capacity = None, None, 232448
     for num_stages in (6, 5, 4) if 128 % best_block_n != 0 else (8, 7, 6, 5, 4):
-        best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n)
+        best_smem_size = get_smem_size(num_stages, k, best_block_m, best_block_n, 128, is_swap_ab)
         if best_smem_size <= sm90_capacity:
             best_num_stages = num_stages
             break
@@ -98,15 +132,20 @@ def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
 
     # Decide the number of TMA multicast
     best_num_tma_multicast = 1
-    if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
-        best_num_tma_multicast = 2
+    if not is_swap_ab:
+        if m >= 1024 and is_tma_multicast_legal(n, best_block_n, 2, num_sms) and num_groups == 1:
+            best_num_tma_multicast = 2
+    else:
+        if n >= 1024 and is_tma_multicast_legal(m, best_block_m, 2, num_sms) and num_groups == 1:
+            best_num_tma_multicast = 2
 
     return best_block_m, best_block_n, best_num_stages, best_num_tma_multicast, best_smem_size
 
 
 def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
                          rhs: Tuple[torch.Tensor, torch.Tensor],
-                         out: torch.Tensor) -> None:
+                         out: torch.Tensor,
+                         use_pdl: bool) -> None:
     """
     Do a normal GEMM with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -151,12 +190,28 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     # Auto-tuning with compilation
     global includes, template
     num_sms = get_num_sms()
-    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(m, n, k, 1, num_sms)
+
+    swap_ab_threshold = 32
+    should_swap_ab = m <= swap_ab_threshold
+
+    """only swap here begin"""
+    if should_swap_ab:
+        config_m, config_n = n, m
+    else:
+        config_m, config_n = m, n
+
+    block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(
+        config_m, config_n, k, 1, num_sms, False, should_swap_ab
+    )
+    """only swap here end"""
+
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
         name='gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n,
-              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast},
+              'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast,
+              'IS_SWAP_AB': 'true' if should_swap_ab else 'false',
+              'IS_PDL': 'true' if use_pdl else 'false'},
         space=(),
         includes=includes,
         arg_defs=(('lhs', torch.float8_e4m3fn), ('lhs_scales', torch.float),
