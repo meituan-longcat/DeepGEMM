@@ -35,7 +35,7 @@ sources = ['csrc/python_api.cpp']
 build_include_dirs = [
     f'{CUDA_HOME}/include',
     f'{CUDA_HOME}/include/cccl',
-    'deep_gemm/include',
+    'deep_gemm_oss/include',
     'third-party/cutlass/include',
     'third-party/fmt/include',
 ]
@@ -54,7 +54,7 @@ base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag
 
 
 def get_package_version():
-    with open(Path(current_dir) / 'deep_gemm' / '__init__.py', 'r') as f:
+    with open(Path(current_dir) / 'deep_gemm_oss' / '__init__.py', 'r') as f:
         version_match = re.search(r'^__version__\s*=\s*(.*)$', f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
 
@@ -109,7 +109,7 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
-    return [CUDAExtension(name='deep_gemm_cpp',
+    return [CUDAExtension(name='deep_gemm_cpp_oss',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
@@ -134,12 +134,12 @@ class CustomBuildPy(build_py):
         for name in ('DG_JIT_CACHE_DIR', 'DG_JIT_PRINT_COMPILER_COMMAND', 'DG_JIT_CPP_STANDARD'):
             code += f"persistent_envs['{name}'] = '{os.environ[name]}'\n" if name in os.environ else ''
 
-        with open(os.path.join(self.build_lib, 'deep_gemm', 'envs.py'), 'w') as f:
+        with open(os.path.join(self.build_lib, 'deep_gemm_oss', 'envs.py'), 'w') as f:
             f.write(code)
 
     def prepare_includes(self):
         # Create temporary build directory instead of modifying package directory
-        build_include_dir = os.path.join(self.build_lib, 'deep_gemm/include')
+        build_include_dir = os.path.join(self.build_lib, 'deep_gemm_oss/include')
         os.makedirs(build_include_dir, exist_ok=True)
 
         # Copy third-party includes to the build directory
@@ -185,11 +185,11 @@ class CachedWheelsCommand(_bdist_wheel):
 if __name__ == '__main__':
     # noinspection PyTypeChecker
     setuptools.setup(
-        name='deep_gemm',
+        name='deep_gemm_oss',
         version=get_package_version(),
         packages=find_packages('.'),
         package_data={
-            'deep_gemm': [
+            'deep_gemm_oss': [
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',

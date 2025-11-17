@@ -1,8 +1,8 @@
 import time
 import torch
 import random
-from deep_gemm.testing import bench_kineto, count_bytes, calc_diff
-from deep_gemm.utils import (
+from deep_gemm_oss.testing import bench_kineto, count_bytes, calc_diff
+from deep_gemm_oss.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8,
     get_tma_aligned_size,

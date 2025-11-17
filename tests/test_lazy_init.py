@@ -1,6 +1,6 @@
 import torch
 import torch.multiprocessing as mp
-import deep_gemm
+import deep_gemm_oss
 
 
 def main(local_rank: int):

@@ -2,9 +2,9 @@ import random
 import torch
 from typing import Tuple
 
-import deep_gemm
-from deep_gemm.testing import bench_kineto, calc_diff, count_bytes
-from deep_gemm.utils import ceil_div, per_custom_dims_cast_to_fp8
+import deep_gemm_oss
+from deep_gemm_oss.testing import bench_kineto, calc_diff, count_bytes
+from deep_gemm_oss.utils import ceil_div, per_custom_dims_cast_to_fp8
 
 from generators import get_arch_major, generate_normal, get_ue8m0_usage, get_kernel_types, MajorTypeAB
 
@@ -42,11 +42,11 @@ def test_gemm_skip_head_mid() -> None:
                 d = apply_skip_head_mid(d, head_splits)
                 ref_d = apply_skip_head_mid(ref_d, head_splits)
 
-                deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
+                deep_gemm_oss.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast)
                 diff = calc_diff(d, ref_d)
                 assert diff < 0.001, f'{m=}, {n=}, {k=}, {kernel_opt}, {diff:.5f}'
 
-                t = bench_kineto(lambda: deep_gemm.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast),
+                t = bench_kineto(lambda: deep_gemm_oss.fp8_gemm_nt_skip_head_mid(a, b, d, head_splits, disable_ue8m0_cast=disable_ue8m0_cast),
                                 'fp8_gemm', suppress_kineto_output=True)
                 print(f' > Perf (m={m:5}, n={n:5}, k={k:5}, {kernel_opt}): '
                     f'{t * 1e6:4.0f} us | '
@@ -125,7 +125,7 @@ def test_mqa_logits():
 
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0, ), False)
-                logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
+                logits = deep_gemm_oss.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
 
                 do_check = (seq_len_kv < 32768)
                 if do_check:
@@ -143,7 +143,7 @@ def test_mqa_logits():
                     ref_cost = ref_fp8_mqa_logits(q=q, kv=kv, weights=weights, cu_seqlen_ks=ks, cu_seqlen_ke=ke, cost_only=True)
 
                 tflops = 2 * ref_cost * num_heads * head_dim / 1e12
-                t, clean_t = bench_kineto(lambda: deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke),
+                t, clean_t = bench_kineto(lambda: deep_gemm_oss.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke),
                                           ('fp8_mqa_logits', 'clean_logits'))
                 clean_bytes = (seq_len * seq_len_kv - ref_cost) * 4 + count_bytes(ks, ke)
                 print(f' > S={seq_len:4}, SKV={seq_len_kv:6}, H={num_heads:3}, D={head_dim:3}, CP={0 if disable_cp else 1}: '
@@ -204,8 +204,9 @@ def test_paged_mqa_logits():
                 q_fp8 = q.to(torch.float8_e4m3fn)
                 kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
 
-                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm.get_num_sms())
-                logits = deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+                schedule_metadata = deep_gemm_oss.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm_oss.get_num_sms())
+                print(f"{schedule_metadata=}")
+                logits = deep_gemm_oss.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
 
                 ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
                 positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * next_n, -1)
@@ -225,13 +226,72 @@ def test_paged_mqa_logits():
                 tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
                 input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
                 output_bytes = sum_lens * next_n * 4
-                t, clean_t = bench_kineto(lambda: deep_gemm.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
+                t, clean_t = bench_kineto(lambda: deep_gemm_oss.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
                                           ('fp8_paged_mqa_logits', 'clean_logits'))
                 clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
                 print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '
                       f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
                       f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s | '
                       f'clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s')
+    print()
+
+def mytest():
+    max_model_len = 111 * 1000
+    num_blocks, blocksize = max_model_len * 3, 64
+    heads, index_dim = 64, 128
+    batch_size = 1
+    next_n = 1
+    avg_kv = 8192
+
+    q = torch.randn((batch_size, 1, heads, index_dim), device='cuda', dtype=torch.bfloat16)
+    kv_cache = torch.randn((num_blocks, blocksize, 1, index_dim), device='cuda', dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * 1, heads), device='cuda', dtype=torch.float32)
+
+    context_lens = torch.tensor([8], dtype=torch.int32).cuda()
+    max_block_len = (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
+    block_tables = torch.zeros((batch_size, max_block_len), device='cuda', dtype=torch.int32)
+
+    counter = 0
+    block_idx_pool = list(range(num_blocks))
+    random.shuffle(block_idx_pool)
+    for i in range(batch_size):
+        ctx_len = context_lens[i].item()
+        for j in range(ceil_div(ctx_len, blocksize)):
+            block_tables[i][j] = block_idx_pool[counter]
+            counter += 1
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache)
+
+    schedule_metadata = deep_gemm_oss.get_paged_mqa_logits_metadata(context_lens, blocksize, deep_gemm_oss.get_num_sms())
+    print(f"{schedule_metadata=}")
+    logits = deep_gemm_oss.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True)
+
+    ref_logits = ref_fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len)
+    positions = torch.arange(max_model_len, device='cuda').unsqueeze(0).expand(batch_size * 1, -1)
+    row_indices = torch.arange(batch_size * next_n, device='cuda') // next_n
+    next_n_offset = torch.arange(batch_size * next_n, device='cuda') % next_n
+    ref_neginf_mask = ~(positions <= (context_lens[row_indices] - next_n + next_n_offset).unsqueeze(1))
+
+    neginf_mask = (logits == float('-inf'))
+    assert torch.equal(neginf_mask, ref_neginf_mask)
+
+    logits = logits.masked_fill(neginf_mask, 0)
+    ref_logits = ref_logits.masked_fill(ref_neginf_mask, 0)
+    diff = calc_diff(logits, ref_logits)
+    assert diff < 1e-3, f"{diff=}"
+
+    sum_lens = sum(context_lens.to(torch.int64))
+    tflops = 2 * sum_lens * next_n * heads * index_dim / 1e12
+    input_bytes = count_bytes(q_fp8, weights, context_lens) + sum_lens * (index_dim + 4) + (sum_lens / blocksize) * 4
+    output_bytes = sum_lens * next_n * 4
+    t, clean_t = bench_kineto(lambda: deep_gemm_oss.fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len, clean_logits=True),
+                                ('fp8_paged_mqa_logits', 'clean_logits'))
+    clean_bytes = (batch_size * next_n * max_model_len - neginf_mask.sum().item()) * 4 + count_bytes(context_lens)
+    print(f' > BSZ={batch_size:3}, NextN={next_n:1}, H={heads:2}, D={index_dim:2}, L={avg_kv:6}: '
+            f'{tflops / t:4.0f} TFLOPS, {t * 1e6:3.0f} us, '
+            f'{(input_bytes + output_bytes) / t / 1e9:4.0f} GB/s | '
+            f'clean: {clean_t * 1e6:3.0f} us, {clean_bytes / clean_t / 1e9:4.0f} GB/s')
     print()
 
 
@@ -241,7 +301,8 @@ if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
 
-    test_gemm_skip_head_mid()
+    # test_gemm_skip_head_mid()
 
-    test_mqa_logits()
-    test_paged_mqa_logits()
+    # test_mqa_logits()
+    # test_paged_mqa_logits()
+    mytest()
