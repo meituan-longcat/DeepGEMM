@@ -42,8 +42,9 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
     std::string output;
     while (fgets(buffer.data(), buffer.size(), pipe.get()))
         output += buffer.data();
-    const auto& exit_code = WEXITSTATUS(pclose(pipe.release()));
-    return {exit_code, output};
+    int status = pclose(pipe.release());
+    int exit_code = WEXITSTATUS(status);
+    return std::make_tuple(exit_code, output);
 }
 
 static std::vector<std::filesystem::path> collect_files(const std::filesystem::path& root) {
@@ -79,9 +80,8 @@ static std::filesystem::path make_dirs(const std::filesystem::path& path) {
 }
 
 static std::string get_uuid() {
-    static std::random_device rd;
     static std::mt19937 gen([]() {
-        return rd() ^ std::chrono::steady_clock::now().time_since_epoch().count();
+        return std::chrono::steady_clock::now().time_since_epoch().count();
     }());
     static std::uniform_int_distribution<uint32_t> dist;
 

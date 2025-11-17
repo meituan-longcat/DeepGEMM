@@ -12,8 +12,8 @@ except ImportError:
     pass
 
 # Configs
-import deep_gemm_cpp
-from deep_gemm_cpp import (
+import deep_gemm_cpp_oss
+from deep_gemm_cpp_oss import (
     set_num_sms,
     get_num_sms,
     set_tc_util,
@@ -21,7 +21,7 @@ from deep_gemm_cpp import (
 )
 
 # Kernels
-from deep_gemm_cpp import (
+from deep_gemm_cpp_oss import (
     # FP8 GEMMs
     fp8_gemm_nt, fp8_gemm_nn,
     fp8_gemm_tn, fp8_gemm_tt,
@@ -79,7 +79,7 @@ def _find_cuda_home() -> str:
     return cuda_home
 
 
-deep_gemm_cpp.init(
+deep_gemm_cpp_oss.init(
     os.path.dirname(os.path.abspath(__file__)), # Library root directory path
     _find_cuda_home()                           # CUDA home
 )

@@ -1,8 +1,8 @@
 import random
 import torch
 
-import deep_gemm
-from deep_gemm.testing import (
+import deep_gemm_oss
+from deep_gemm_oss.testing import (
     bench, bench_kineto,
     calc_diff, count_bytes
 )
@@ -20,10 +20,10 @@ def test_bmk_bnk_mn() -> None:
 
                 # Test correctness
                 ref_d = (c if dtype == torch.float else 0) + torch.bmm(a.float(), b.float().mT).sum(0)
-                deep_gemm.einsum('bmk,bnk->mn', a, b, d, c=c)
+                deep_gemm_oss.einsum('bmk,bnk->mn', a, b, d, c=c)
                 assert calc_diff(d, ref_d) < 1e-5
 
-                t = bench_kineto(lambda: deep_gemm.einsum('bmk,bnk->mn', a, b, d, c=c), 'bmn_bnk_mn_gemm_impl', suppress_kineto_output=True)
+                t = bench_kineto(lambda: deep_gemm_oss.einsum('bmk,bnk->mn', a, b, d, c=c), 'bmn_bnk_mn_gemm_impl', suppress_kineto_output=True)
                 print(f' > Perf (b={s:4.0f}, {m=}, {n=}, {k=}, {"FP32" if dtype == torch.float else "BF16"}): ',
                     f'{t * 1e6:4.0f} us | '
                     f'{2 * s * m * n * k / t / 1e12:4.0f} TFLOPS | '
@@ -40,10 +40,10 @@ def test_bhr_hdr_bhd():
             y = fy[:, :, :r]
             ref_z = torch.einsum('bhr,hdr->bhd', x, y)
             z = torch.empty((b, h, d), device='cuda', dtype=torch.bfloat16)
-            deep_gemm.einsum('bhr,hdr->bhd', x, y, z)
+            deep_gemm_oss.einsum('bhr,hdr->bhd', x, y, z)
             assert calc_diff(z, ref_z) < 1e-10
 
-            t = bench_kineto(lambda: deep_gemm.einsum('bhr,hdr->bhd', x, y, z), 'nvjet', suppress_kineto_output=True)
+            t = bench_kineto(lambda: deep_gemm_oss.einsum('bhr,hdr->bhd', x, y, z), 'nvjet', suppress_kineto_output=True)
             print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                   f'{t * 1e6:4.0f} us | '
                   f'{2 * b * h * r * d / t / 1e12:.0f} TFLOPS | '
@@ -60,10 +60,10 @@ def test_bhd_hdr_bhr():
             y = fy[:, :, :r]
             ref_z = torch.einsum('bhd,hdr->bhr', x, y)
             z = torch.empty((b, h, r), device='cuda', dtype=torch.bfloat16)
-            deep_gemm.einsum('bhd,hdr->bhr', x, y, z)
+            deep_gemm_oss.einsum('bhd,hdr->bhr', x, y, z)
             assert calc_diff(z, ref_z) < 1e-10
 
-            t = bench_kineto(lambda: deep_gemm.einsum('bhd,hdr->bhr', x, y, z), 'nvjet', suppress_kineto_output=True)
+            t = bench_kineto(lambda: deep_gemm_oss.einsum('bhd,hdr->bhr', x, y, z), 'nvjet', suppress_kineto_output=True)
             print(f' > Perf ({b=:4.0f}, {h=}, {r=}, {d=}): ',
                   f'{t * 1e6:4.0f} us | '
                   f'{2 * b * h * r * d / t / 1e12:.0f} TFLOPS | '
@@ -78,7 +78,7 @@ if __name__ == '__main__':
     random.seed(0)
 
     print('Library path:')
-    print(f' > {deep_gemm.__path__}\n')
+    print(f' > {deep_gemm_oss.__path__}\n')
 
     test_bmk_bnk_mn()
     test_bhr_hdr_bhd()

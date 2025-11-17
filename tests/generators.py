@@ -3,7 +3,7 @@ import random
 import torch
 from typing import Generator, List
 
-from deep_gemm.utils import (
+from deep_gemm_oss.utils import (
     align, ceil_div,
     per_token_cast_to_fp8, per_channel_cast_to_fp8, per_block_cast_to_fp8,
     get_mk_alignment_for_contiguous_layout
