@@ -42,7 +42,8 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
     std::string output;
     while (fgets(buffer.data(), buffer.size(), pipe.get()))
         output += buffer.data();
-    const auto& exit_code = WEXITSTATUS(pclose(pipe.release()));
+    int status = pclose(pipe.release());
+    int exit_code = WEXITSTATUS(status);
     return std::make_tuple(exit_code, output);
 }
 
