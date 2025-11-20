@@ -43,7 +43,7 @@ static std::tuple<int, std::string> call_external_command(std::string command) {
     while (fgets(buffer.data(), buffer.size(), pipe.get()))
         output += buffer.data();
     const auto& exit_code = WEXITSTATUS(pclose(pipe.release()));
-    return {exit_code, output};
+    return std::make_tuple(exit_code, output);
 }
 
 static std::vector<std::filesystem::path> collect_files(const std::filesystem::path& root) {
