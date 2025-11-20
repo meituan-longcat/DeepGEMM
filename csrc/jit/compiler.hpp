@@ -53,7 +53,7 @@ public:
         DG_HOST_ASSERT(not library_version.empty());
 
         // Cache settings
-        cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm";
+        cache_dir_path = std::filesystem::path(get_env<std::string>("HOME")) / ".deep_gemm_oss";
         if (const auto& env_cache_dir_path = get_env<std::string>("DG_JIT_CACHE_DIR"); not env_cache_dir_path.empty())
             cache_dir_path = env_cache_dir_path;
 
