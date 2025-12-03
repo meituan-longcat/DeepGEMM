@@ -80,9 +80,8 @@ static std::filesystem::path make_dirs(const std::filesystem::path& path) {
 }
 
 static std::string get_uuid() {
-    static std::random_device rd;
     static std::mt19937 gen([]() {
-        return rd() ^ std::chrono::steady_clock::now().time_since_epoch().count();
+        return std::chrono::steady_clock::now().time_since_epoch().count();
     }());
     static std::uniform_int_distribution<uint32_t> dist;
 
