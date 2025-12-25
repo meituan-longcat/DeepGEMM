@@ -21,6 +21,7 @@ constexpr auto kIsSwapAB = {IS_SWAP_AB};
 using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
 
 // Launch kernel
+// 只交换 desc
 if constexpr (kIsSwapAB) {
     auto tma_a_desc = GemmType::make_2d_tma_a_desc_swap_ab(rhs, N);
     auto tma_b_desc = GemmType::make_2d_tma_b_desc_swap_ab(lhs, m);
@@ -43,6 +44,7 @@ if constexpr (kIsSwapAB) {
 """
 
 
+# 看的是权重的 n 能不能整除 2 倍的 block_n
 def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
@@ -69,16 +71,16 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
     else:
         smem_d = block_n * block_m * 2
         smem_a_per_stage = block_m * block_k
-        smem_scales_a_per_stage = ceil_div(k, block_k) * 4
         smem_b_per_stage = block_n * block_k
         smem_scales_b = ceil_div(block_n * 4, 128) * 128
+        smem_scales_a_per_stage = ceil_div(k, block_k) * 4
         smem_barrier = num_stages * 8 * 2
 
         smem_size = 0
         smem_size += smem_d
         smem_size += num_stages * smem_a_per_stage
-        smem_size += num_stages * smem_scales_b
         smem_size += num_stages * smem_b_per_stage
+        smem_size += num_stages * smem_scales_b
         smem_size += ceil_div(smem_scales_a_per_stage, 8) * 8
         smem_size += smem_barrier
         return smem_size
@@ -186,8 +188,9 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     num_sms = get_num_sms()
 
     swap_ab_threshold = 32
-    should_swap_ab = m < swap_ab_threshold
+    should_swap_ab = m <= swap_ab_threshold
 
+    """only 交换 here begin"""
     if should_swap_ab:
         config_m, config_n = n, m
     else:
@@ -196,6 +199,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(
         config_m, config_n, k, 1, num_sms, False, should_swap_ab
     )
+    """only 交换 here end"""
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(

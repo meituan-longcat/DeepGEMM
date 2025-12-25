@@ -8,6 +8,7 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <cutlass/arch/grid_dependency_control.h>
 
 #include "mma_utils.cuh"
 #include "scheduler.cuh"
@@ -22,7 +23,7 @@ enum class Layout {
 };
 
 template <uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup>
-__device__ __host__ constexpr int get_num_threads_per_sm(int block_m) {
+__device__ __host__ constexpr int get_num_threads_per_sm(int block_m) { // block_m is 64 or 128
     DG_STATIC_ASSERT(kNumMathThreadsPerGroup == 128, "Only support 128 threads per math group");
     return (block_m == 64 ? 1 : 2) * kNumMathThreadsPerGroup + kNumTMAThreads;
 }
@@ -397,12 +398,20 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 #endif
 }
 
+enum class ProducerWarpRole {
+    Warp0 = 0,
+    PrefetchMK = 1,
+    Warp2 = 2,
+    UnusedWarp = 3
+};
+
+// 在 gemm.py 中有 assert，保证了 SHAPE_M 能够被 64 整除，SHAPE_K 能够被 128 整除。
 template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
     uint32_t kNumStages, uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast,
     typename SchedulerType>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
-                        int* grouped_layout, uint32_t shape_m,
+                        int* grouped_layout, uint32_t shape_m/* not used, 其实应该是 shape_n 了 */,
                         const __grid_constant__ CUtensorMap tensor_map_a,
                         const __grid_constant__ CUtensorMap tensor_map_b,
                         const __grid_constant__ CUtensorMap tensor_map_scales_b,
@@ -411,7 +420,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(ceil_div(BLOCK_M, BLOCK_K) == 1, "Too much A scales in a single block");
+    DG_STATIC_ASSERT(ceil_div(BLOCK_M, BLOCK_K) == 1, "Too much A scales in a single block"); // 64 or 128, 就 1 个 scale
 
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
@@ -486,16 +495,17 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
     if (threadIdx.x == kNumMathThreads) {
 #pragma unroll
         for (int i = 0; i < kNumStages; ++i) {
-            full_barriers[i]->init(1);
+            full_barriers[i]->init(2);
+            // kNumTMAMulticast 在激活值上有复用关系
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
-        // Make initialized barrier visible in async proxy
+        // Make initialized **barrier visible in async proxy**
         cutlass::arch::fence_view_async_shared();
         (kNumTMAMulticast > 1) ? cutlass::arch::fence_barrier_init() : void();
     }
 
-    // Synchronize all threads to make barrier visible in normal memory model
+    // Synchronize all threads to make **barrier visible in normal memory model**
     (kNumTMAMulticast > 1) ? cute::cluster_sync() : __syncthreads();
 
     // For pipeline unrolling
@@ -521,32 +531,40 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
     auto scheduler = SchedulerType(scheduler_input);
 
     if (threadIdx.x >= kNumMathThreads) {
+        int lane_idx = cutlass::canonical_lane_idx();
+        int warp_idx_in_warp_group = cutlass::canonical_warp_idx_sync() % 4;
+        auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
         // TMA warp-group for loading data
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
 
-        // NOTES: only one thread (or warp) will be used
-        if (threadIdx.x == kNumMathThreads) {
+        if (producer_warp_role == ProducerWarpRole::Warp0 && lane_idx == 0) {
+            // Ensure that the kernel does not touch
+            // unflushed global memory prior to this instruction
+            cutlass::arch::wait_on_dependent_grids();
+
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 launch_k_iterations(
                     [&](int k_iter, auto type) {
                         constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
                         constexpr int kNumInnerStages
-                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K;
+                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K; // 需要 gemm.py 中的 assert 保证正确性
                         DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
 #pragma unroll
                         for (uint32_t s = 0; s < kNumInnerStages; ++s) {
                             // Wait consumer release
+                            // 这个 CTA 处理的第 current_iter 个 C block
+                            // 每个 C block 都有 kNumIterations
+                            // 实现了跨 C block 的平滑/不中断的 TMA
                             empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
-                            // Issue TMA A (weight) now without broadcasting
                             auto& full_barrier = *full_barriers[s];
                             int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
-                                scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
 
                             // Issue TMA B (act) with broadcasting
+                            // 这个 block 的左上角坐标
                             tma_copy<kNumTMAMulticast>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                 smem_b[s], k_idx, scheduler.get_global_n_idx(n_block_idx));
 
@@ -556,13 +574,13 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                                     reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
                                     scheduler.get_global_scales_b_idx(n_block_idx), k_idx / BLOCK_K);
                             } else {
+                                // 注意和上面 TMA B 的坐标转置关系
                                 tma_copy<kNumTMAMulticast>(&tensor_map_scales_b,
-                                    reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s], n_block_idx * BLOCK_N,
-                                    scheduler.get_global_scales_b_idx(k_idx / BLOCK_K));
+                                    reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
+                                    n_block_idx * BLOCK_N, scheduler.get_global_scales_b_idx(k_idx / BLOCK_K));
                             }
 
-                            full_barrier.arrive_and_expect_tx(
-                                SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_B_SIZE_PER_STAGE);
+                            full_barrier.arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_B_SIZE_PER_STAGE);
                         }
 
 // Wait unaligned cases
@@ -574,6 +592,53 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                     });
             }
 
+            // 等另外一个 CTA?
+            // To safely deconstruct distributed shared barriers, we need another round of empty waits
+            if constexpr (kNumTMAMulticast > 1) {
+#pragma unroll
+                for (uint32_t s = 0; s < kNumStages; ++s)
+                    empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + 1) & 1);
+            }
+        }
+
+        if (producer_warp_role == ProducerWarpRole::Warp2 && lane_idx == 0) {
+            // Persistently schedule over blocks
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                launch_k_iterations(
+                    [&](int k_iter, auto type) {
+                        constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
+                        constexpr int kNumInnerStages
+                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K; // 需要 gemm.py 中的 assert 保证正确性
+                        DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
+
+#pragma unroll
+                        for (uint32_t s = 0; s < kNumInnerStages; ++s) {
+                            // Wait consumer release
+                            // 这个 CTA 处理的第 current_iter 个 C block
+                            // 每个 C block 都有 kNumIterations
+                            // 实现了跨 C block 的平滑/不中断的 TMA
+                            empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+
+                            // Issue TMA A (weight) now without broadcasting
+                            auto& full_barrier = *full_barriers[s];
+                            int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
+                            // 这个 block 的左上角坐标
+                            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
+                                scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
+
+                            full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
+                        }
+
+// Wait unaligned cases
+#pragma unroll
+                        for (uint32_t s = kNumInnerStages; s < kNumStages; ++s) {
+                            empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
+                            full_barriers[s]->arrive();
+                        }
+                    });
+            }
+
+            // 等另外一个 CTA?
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kNumTMAMulticast > 1) {
 #pragma unroll
@@ -631,7 +696,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                     DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
 #pragma unroll
-                    for (int s = 0; s < kNumInnerStages; ++s) {
+                    for (uint32_t s = 0; s < kNumInnerStages; ++s) {
                         // Read weight scales (A scales)
                         float scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
 
@@ -816,6 +881,7 @@ public:
         DG_HOST_ASSERT(status == cudaSuccess);
     }
 
+    // scales_b: always 权重的 scales
     static void run_swap_ab(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                             uint32_t shape_m,
                             const CUtensorMap& tma_a_desc,
@@ -824,11 +890,13 @@ public:
                             const CUtensorMap& tma_d_desc,
                             cudaStream_t stream,
                             int num_sms, uint32_t smem_size) {
+        // 词不达意
         using SchedulerType = typename SchedulerSelectorSwapAB<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumTMAMulticast>::type;
 
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
+        // 这是最后一次词不达意
         auto kernel = fp8_gemm_kernel_swap_ab<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                               kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
                                               kNumTMAMulticast, SchedulerType>;
@@ -843,11 +911,13 @@ public:
 
         // Clusters for TMA multicast
         // NOTES: `>= 4` cluster size will cause performance degradation
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeClusterDimension;
-        attr.val.clusterDim = {kNumTMAMulticast, 1, 1};
-        config.attrs = &attr;
-        config.numAttrs = 1;
+        cudaLaunchAttribute attr[2];
+        attr[0].id = cudaLaunchAttributeClusterDimension;
+        attr[0].val.clusterDim = {kNumTMAMulticast, 1, 1};
+        attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attr[1].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attr;
+        config.numAttrs = 2;
 
         typename SchedulerType::Input scheduler_input;
         if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::GroupedMasked) {

@@ -89,7 +89,7 @@ def make_tmp_dir():
 def put(path, data, is_binary=False):
     # Write and do POSIX atomic replace
     tmp_file_path = f'{make_tmp_dir()}/file.tmp.{str(uuid.uuid4())}.{hash_to_hex(path)}'
-    with open(tmp_file_path, 'wb' if is_binary else 'w') as f:
+    with open(tmp_file_path, 'wb' if is_binary else 'w', encoding='utf-8') as f:
         f.write(data)
     os.replace(tmp_file_path, path)
 
@@ -100,7 +100,7 @@ def build(name: str, arg_defs: tuple, code: str) -> Runtime:
                   '-gencode=arch=compute_90a,code=sm_90a',
                   '--ptxas-options=--register-usage-level=10' + (',--verbose' if 'DG_PTXAS_VERBOSE' in os.environ else ''),
                   # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases
-                  '--diag-suppress=177,174,940']
+                  '--diag-suppress=177,174,940', "-lineinfo", "-DCUTLASS_ENABLE_GDC_FOR_SM90=1"]
     cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi']
     flags = [*nvcc_flags, f'--compiler-options={",".join(cxx_flags)}']
     include_dirs = [get_jit_include_dir()]
