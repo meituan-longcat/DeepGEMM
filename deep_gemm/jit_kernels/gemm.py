@@ -1,5 +1,6 @@
 import torch
 from typing import Tuple
+import functools
 
 from .tuner import jit_tuner
 from .utils import get_num_sms, ceil_div, get_col_major_tma_aligned_tensor, get_m_alignment_for_contiguous_layout
@@ -86,6 +87,7 @@ def get_smem_size(num_stages: int, k: int, block_m: int, block_n: int, block_k: 
         return smem_size
 
 
+@functools.lru_cache(maxsize=None)
 def get_best_configs(m: int, n: int, k: int, num_groups: int, num_sms: int,
                      is_grouped_contiguous: bool = False, is_swap_ab = False) -> Tuple[int, int, int, int, int]:
     if not is_grouped_contiguous:
