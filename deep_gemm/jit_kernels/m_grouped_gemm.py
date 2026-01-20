@@ -18,6 +18,7 @@ constexpr auto kNumStages = {NUM_STAGES};
 constexpr auto kNumTMAMulticast = {NUM_TMA_MULTICAST};
 constexpr auto kIsSwapAB = {IS_SWAP_AB};
 constexpr auto kIsWithOffset = (GemmType::{GEMM_TYPE} == GemmType::GroupedWithOffset);
+constexpr auto kIsPDL = {IS_PDL};
 
 // Make a templated grouped GEMM
 using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, {NUM_GROUPS}, kNumStages, kNumTMAMulticast, GemmType::{GEMM_TYPE}>;
@@ -29,7 +30,7 @@ if constexpr (kIsSwapAB) {
     auto tma_scales_b_desc = kIsWithOffset ? GemmType::make_tma_scales_b_offset_desc_swap_ab(lhs_scales, m, {NUM_GROUPS})
                                            : GemmType::make_2d_tma_scales_b_desc_swap_ab(lhs_scales, m);
     auto tma_d_desc = GemmType::make_2d_tma_d_desc_swap_ab(out, m);
-    GemmType::run_swap_ab(out, rhs_scales, grouped_layout,
+    GemmType::run_swap_ab<kIsPDL>(out, rhs_scales, grouped_layout,
                           m,
                           tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc,
                           stream, num_sms, smem_size);
@@ -49,7 +50,7 @@ if constexpr (kIsSwapAB) {
 
 def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Tensor],
                                               rhs: Tuple[torch.Tensor, torch.Tensor],
-                                              out: torch.Tensor, m_indices: torch.Tensor) -> None:
+                                              out: torch.Tensor, m_indices: torch.Tensor, use_pdl: bool) -> None:
     """
     Do a grouped GEMM (contiguous format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -109,6 +110,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
         name='m_grouped_gemm_fp8_fp8_bf16_nt',
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast,
+              'IS_PDL': 'true' if use_pdl else 'false',
               'IS_SWAP_AB': 'false', 'GEMM_TYPE': 'GroupedContiguous'},
         space=(),
         includes=includes,
@@ -127,7 +129,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs: Tuple[torch.Tensor, torch.Ten
 
 def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor],
                                           rhs: Tuple[torch.Tensor, torch.Tensor],
-                                          out: torch.Tensor, masked_m: torch.Tensor, expected_m: int) -> None:
+                                          out: torch.Tensor, masked_m: torch.Tensor, expected_m: int, use_pdl: bool) -> None:
     """
     Do a grouped GEMM (masked format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -203,6 +205,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast,
               'IS_SWAP_AB': 'true' if should_swap_ab else 'false',
+              'IS_PDL': 'true' if use_pdl else 'false',
               'GEMM_TYPE': 'GroupedMasked'},
         space=(),
         includes=includes,
@@ -221,7 +224,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs: Tuple[torch.Tensor, torch.Tensor]
 
 def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor],
                                           rhs: Tuple[torch.Tensor, torch.Tensor],
-                                          out: torch.Tensor, m_offset: torch.Tensor) -> None:
+                                          out: torch.Tensor, m_offset: torch.Tensor, use_pdl: bool) -> None:
     """
     Do a grouped GEMM (offset format) with FP8 inputs and BF16 output, with 1x128 LHS scaling and 128x128 RHS scaling.
     LHS, RHS, RHS scaling factors, and output tensors must be in contiguous format.
@@ -294,6 +297,7 @@ def m_grouped_gemm_fp8_fp8_bf16_nt_offset(lhs: Tuple[torch.Tensor, torch.Tensor]
         keys={'N': n, 'K': k, 'BLOCK_M': block_m, 'BLOCK_N': block_n, 'NUM_GROUPS': num_groups,
               'NUM_STAGES': num_stages, 'NUM_TMA_MULTICAST': num_tma_multicast,
               'IS_SWAP_AB': 'true' if should_swap_ab else 'false',
+              'IS_PDL': 'true' if use_pdl else 'false',
               'GEMM_TYPE': 'GroupedWithOffset'},
         space=(),
         includes=includes,

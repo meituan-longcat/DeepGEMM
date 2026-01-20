@@ -406,7 +406,7 @@ enum class ProducerWarpRole {
 };
 
 // 在 gemm.py 中有 assert，保证了 SHAPE_M 能够被 64 整除，SHAPE_K 能够被 128 整除。
-template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
+template <bool PDL, uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
     uint32_t kNumStages, uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast,
     typename SchedulerType>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
@@ -539,9 +539,11 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
 
         if (producer_warp_role == ProducerWarpRole::Warp0 && lane_idx == 0) {
-            // Ensure that the kernel does not touch
-            // unflushed global memory prior to this instruction
-            cutlass::arch::wait_on_dependent_grids();
+            if constexpr (PDL) {
+                // Ensure that the kernel does not touch
+                // unflushed global memory prior to this instruction
+                cutlass::arch::wait_on_dependent_grids();
+            }
 
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -882,6 +884,7 @@ public:
     }
 
     // scales_b: always 权重的 scales
+    template<bool PDL>
     static void run_swap_ab(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                             uint32_t shape_m,
                             const CUtensorMap& tma_a_desc,
@@ -897,7 +900,7 @@ public:
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
         // 这是最后一次词不达意
-        auto kernel = fp8_gemm_kernel_swap_ab<SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
+        auto kernel = fp8_gemm_kernel_swap_ab<PDL, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                               kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
                                               kNumTMAMulticast, SchedulerType>;
         DG_HOST_ASSERT(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size) == cudaSuccess);
@@ -912,12 +915,19 @@ public:
         // Clusters for TMA multicast
         // NOTES: `>= 4` cluster size will cause performance degradation
         cudaLaunchAttribute attr[2];
-        attr[0].id = cudaLaunchAttributeClusterDimension;
-        attr[0].val.clusterDim = {kNumTMAMulticast, 1, 1};
-        attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr[1].val.programmaticStreamSerializationAllowed = 1;
-        config.attrs = attr;
-        config.numAttrs = 2;
+        if constexpr (PDL) {
+            attr[0].id = cudaLaunchAttributeClusterDimension;
+            attr[0].val.clusterDim = {kNumTMAMulticast, 1, 1};
+            attr[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attr[1].val.programmaticStreamSerializationAllowed = 1;
+            config.attrs = attr;
+            config.numAttrs = 2;
+        } else {
+            attr[0].id = cudaLaunchAttributeClusterDimension;
+            attr[0].val.clusterDim = {kNumTMAMulticast, 1, 1};
+            config.attrs = attr;
+            config.numAttrs = 1;
+        }
 
         typename SchedulerType::Input scheduler_input;
         if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::GroupedMasked) {
