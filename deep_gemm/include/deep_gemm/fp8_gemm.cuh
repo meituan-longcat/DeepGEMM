@@ -405,13 +405,13 @@ enum class ProducerWarpRole {
     UnusedWarp = 3
 };
 
-// 在 gemm.py 中有 assert，保证了 SHAPE_M 能够被 64 整除，SHAPE_K 能够被 128 整除。
+// gemm.py asserts ensure SHAPE_M is divisible by 64 and SHAPE_K is divisible by 128.
 template <bool PDL, uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K, uint32_t kNumGroups,
     uint32_t kNumStages, uint32_t kNumTMAThreads, uint32_t kNumMathThreadsPerGroup, uint32_t kNumTMAMulticast,
     typename SchedulerType>
 __global__ void __launch_bounds__(get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M), 1)
 fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
-                        int* grouped_layout, uint32_t shape_m/* not used, 其实应该是 shape_n 了 */,
+                        int* grouped_layout, uint32_t shape_m/* not used, should be shape_n */,
                         const __grid_constant__ CUtensorMap tensor_map_a,
                         const __grid_constant__ CUtensorMap tensor_map_b,
                         const __grid_constant__ CUtensorMap tensor_map_scales_b,
@@ -420,7 +420,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
-    DG_STATIC_ASSERT(ceil_div(BLOCK_M, BLOCK_K) == 1, "Too much A scales in a single block"); // 64 or 128, 就 1 个 scale
+    DG_STATIC_ASSERT(ceil_div(BLOCK_M, BLOCK_K) == 1, "Too much A scales in a single block"); // 64 or 128, only 1 scale
 
     // Types
     using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
@@ -496,7 +496,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
 #pragma unroll
         for (int i = 0; i < kNumStages; ++i) {
             full_barriers[i]->init(2);
-            // kNumTMAMulticast 在激活值上有复用关系
+            // kNumTMAMulticast reuses activations
             empty_barriers[i]->init(kNumTMAMulticast * kNumMathThreads / 32);
         }
 
@@ -551,22 +551,22 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                     [&](int k_iter, auto type) {
                         constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
                         constexpr int kNumInnerStages
-                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K; // 需要 gemm.py 中的 assert 保证正确性
+                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K; // relies on gemm.py asserts for correctness
                         DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
 #pragma unroll
                         for (uint32_t s = 0; s < kNumInnerStages; ++s) {
                             // Wait consumer release
-                            // 这个 CTA 处理的第 current_iter 个 C block
-                            // 每个 C block 都有 kNumIterations
-                            // 实现了跨 C block 的平滑/不中断的 TMA
+                            // This CTA handles the current_iter-th C block
+                            // Each C block has kNumIterations
+                            // Enables smooth, uninterrupted TMA across C blocks
                             empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
                             auto& full_barrier = *full_barriers[s];
                             int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
 
                             // Issue TMA B (act) with broadcasting
-                            // 这个 block 的左上角坐标
+                            // Top-left coordinate of this block
                             tma_copy<kNumTMAMulticast>(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                 smem_b[s], k_idx, scheduler.get_global_n_idx(n_block_idx));
 
@@ -576,7 +576,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                                     reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
                                     scheduler.get_global_scales_b_idx(n_block_idx), k_idx / BLOCK_K);
                             } else {
-                                // 注意和上面 TMA B 的坐标转置关系
+                                // Note the transposed coordinate relation to TMA B above
                                 tma_copy<kNumTMAMulticast>(&tensor_map_scales_b,
                                     reinterpret_cast<uint64_t*>(&full_barrier), smem_scales_b[s],
                                     n_block_idx * BLOCK_N, scheduler.get_global_scales_b_idx(k_idx / BLOCK_K));
@@ -594,7 +594,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                     });
             }
 
-            // 等另外一个 CTA?
+            // Wait for another CTA?
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kNumTMAMulticast > 1) {
 #pragma unroll
@@ -610,21 +610,21 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                     [&](int k_iter, auto type) {
                         constexpr bool kHasDivisibleStages = std::is_same_v<decltype(type), DivisibleK>;
                         constexpr int kNumInnerStages
-                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K; // 需要 gemm.py 中的 assert 保证正确性
+                            = kHasDivisibleStages ? kNumStages : (SHAPE_K % kFullKOfAllStages) / BLOCK_K; // relies on gemm.py asserts for correctness
                         DG_STATIC_ASSERT(kNumInnerStages != 0, "Invalid number of inner stages");
 
 #pragma unroll
                         for (uint32_t s = 0; s < kNumInnerStages; ++s) {
                             // Wait consumer release
-                            // 这个 CTA 处理的第 current_iter 个 C block
-                            // 每个 C block 都有 kNumIterations
-                            // 实现了跨 C block 的平滑/不中断的 TMA
+                            // This CTA handles the current_iter-th C block
+                            // Each C block has kNumIterations
+                            // Enables smooth, uninterrupted TMA across C blocks
                             empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
                             // Issue TMA A (weight) now without broadcasting
                             auto& full_barrier = *full_barriers[s];
                             int k_idx = k_iter * kFullKOfAllStages + s * BLOCK_K;
-                            // 这个 block 的左上角坐标
+                            // Top-left coordinate of this block
                             tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
                                 scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
 
@@ -640,7 +640,7 @@ fp8_gemm_kernel_swap_ab(__nv_bfloat16* gmem_d, float* scales_a,
                     });
             }
 
-            // 等另外一个 CTA?
+            // Wait for another CTA?
             // To safely deconstruct distributed shared barriers, we need another round of empty waits
             if constexpr (kNumTMAMulticast > 1) {
 #pragma unroll
@@ -883,7 +883,7 @@ public:
         DG_HOST_ASSERT(status == cudaSuccess);
     }
 
-    // scales_b: always 权重的 scales
+    // scales_b: always weight scales
     template<bool PDL>
     static void run_swap_ab(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                             uint32_t shape_m,
@@ -893,13 +893,13 @@ public:
                             const CUtensorMap& tma_d_desc,
                             cudaStream_t stream,
                             int num_sms, uint32_t smem_size) {
-        // 词不达意
+        // poor wording
         using SchedulerType = typename SchedulerSelectorSwapAB<kGemmType, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K, kNumGroups, kNumTMAMulticast>::type;
 
         // NOTES: we must use 4 warps to do TMA, because `setmaxnreg.aligned` requires 4 warps
         constexpr uint32_t kNumTMAThreads = 128;
         constexpr uint32_t kNumMathThreadsPerGroup = 128;
-        // 这是最后一次词不达意
+        // final poor wording
         auto kernel = fp8_gemm_kernel_swap_ab<PDL, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
                                               kNumGroups, kNumStages, kNumTMAThreads, kNumMathThreadsPerGroup,
                                               kNumTMAMulticast, SchedulerType>;

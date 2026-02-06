@@ -137,7 +137,7 @@ struct NormalSchedulerSwapAB
     __device__ __forceinline__ NormalSchedulerSwapAB(Input& input)
     {
         num_aligned_n_blocks = ceil_div(input.shape_n, BLOCK_N);
-        num_blocks = num_aligned_n_blocks * kNumMBlocks; // kNumMBlocks 也是 ceil_div 出来的
+        num_blocks = num_aligned_n_blocks * kNumMBlocks; // kNumMBlocks is also computed via ceil_div
     }
 
     // weight
@@ -175,7 +175,7 @@ struct NormalSchedulerSwapAB
             return false;
         }
 
-        // 按照转置来 swizzle
+        // Swizzle according to the transpose
         get_swizzled_block_idx<kNumTMAMulticast, kNumMBlocks, kNumMBlocksPerGroup>(
             num_aligned_n_blocks, next_block_idx, n_block_idx, m_block_idx);
         return true;

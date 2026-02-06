@@ -23,7 +23,7 @@ constexpr auto kIsPDL = {IS_PDL};
 using GemmType = Gemm<N, K, BLOCK_M, BLOCK_N, 128, 1, kNumStages, kNumTMAMulticast, GemmType::Normal>;
 
 // Launch kernel
-// 只交换 desc
+// Only swap descriptors
 if constexpr (kIsSwapAB) {
     auto tma_a_desc = GemmType::make_2d_tma_a_desc_swap_ab(rhs, N);
     auto tma_b_desc = GemmType::make_2d_tma_b_desc_swap_ab(lhs, m);
@@ -46,7 +46,7 @@ if constexpr (kIsSwapAB) {
 """
 
 
-# 看的是权重的 n 能不能整除 2 倍的 block_n
+# Check whether weight n is divisible by 2x block_n
 def is_tma_multicast_legal(n: int, block_n: int, num_tma_multicast: int, num_sms: int) -> bool:
     if num_tma_multicast == 1:
         return True
@@ -194,7 +194,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     swap_ab_threshold = 32
     should_swap_ab = m <= swap_ab_threshold
 
-    """only 交换 here begin"""
+    """only swap here begin"""
     if should_swap_ab:
         config_m, config_n = n, m
     else:
@@ -203,7 +203,7 @@ def gemm_fp8_fp8_bf16_nt(lhs: Tuple[torch.Tensor, torch.Tensor],
     block_m, block_n, num_stages, num_tma_multicast, smem_size = get_best_configs(
         config_m, config_n, k, 1, num_sms, False, should_swap_ab
     )
-    """only 交换 here end"""
+    """only swap here end"""
 
     args = (lhs, lhs_scales, rhs, rhs_scales, out, m, torch.cuda.current_stream(), num_sms, smem_size)
     runtime = jit_tuner.compile_and_tune(
